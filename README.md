@@ -138,6 +138,9 @@ The experiments use the settings of the paper.
 DiskANN uses W = 8, and PipeANN, NemoANN, and PipeANN-Filter use W = 32.
 PipeANN and NemoANN start from the in-memory navigation graph (`mem_L = 10`), and NemoANN uses R_max = 32.
 All runs use the 10K public queries and report Recall@10.
+PipeANN and NemoANN give each search thread an io_uring instance with a kernel polling thread (`IORING_SETUP_SQPOLL`), so T search threads keep up to 2T threads busy.
+The paper runs 32 search threads on a server with 64 logical CPUs.
+On a machine with fewer logical CPUs, set `THREADS` so that twice the largest thread count still fits, because otherwise the polling threads take CPU time away from the search threads.
 The scripts run each point of DiskANN, PipeANN, NemoANN, and PipeANN-Filter in a new process, and sweep L in one process for Vamana and Filtered-DiskANN.
 
 ### Baselines
