@@ -215,11 +215,6 @@ void LinuxAlignedFileReader::poll_all(void *ctx) {
   }
 }
 
-unsigned LinuxAlignedFileReader::cq_ready(void *ctx) {
-  io_uring *ring = (io_uring *) ctx;
-  return io_uring_cq_ready(ring);
-}
-
 void LinuxAlignedFileReader::poll_wait(void *ctx) {
   io_uring *ring = (io_uring *) ctx;
   io_uring_cqe *cqe = nullptr;
@@ -480,10 +475,6 @@ void LinuxAlignedFileReader::poll_all(void *ctx) {
       req->finished = true;
     }
   }
-}
-
-unsigned LinuxAlignedFileReader::cq_ready(void *ctx) {
-  return 0;  // libaio: no non-destructive CQ peek available
 }
 
 void LinuxAlignedFileReader::poll_wait(void *ctx) {

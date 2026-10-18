@@ -10,8 +10,8 @@
 #include "utils/timer.h"
 #include "utils.h"
 
-#include <filesystem>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include "utils/tsl/robin_set.h"
 
@@ -41,30 +41,6 @@ namespace pipeann {
   }
 
   template<typename T, typename TagT>
-  void SSDIndex<T, TagT>::copy_index(const std::string &prefix_in, const std::string &prefix_out) {
-    LOG(INFO) << "Copying disk index from " << prefix_in << " to " << prefix_out;
-    std::filesystem::copy(prefix_in + "_disk.index", prefix_out + "_disk.index",
-                          std::filesystem::copy_options::overwrite_existing);
-    if (file_exists(prefix_in + "_disk.index.tags")) {
-      std::filesystem::copy(prefix_in + "_disk.index.tags", prefix_out + "_disk.index.tags",
-                            std::filesystem::copy_options::overwrite_existing);
-    } else {
-      // remove the original tags.
-      std::filesystem::remove(prefix_out + "_disk.index.tags");
-    }
-
-    // nbr.
-    this->nbr_handler->load(prefix_in.c_str());
-    this->nbr_handler->save(prefix_out.c_str());
-
-    // partition data
-    if (file_exists(prefix_in + "_partition.bin.aligned")) {
-      std::filesystem::copy(prefix_in + "_partition.bin.aligned", prefix_out + "_partition.bin.aligned",
-                            std::filesystem::copy_options::overwrite_existing);
-    }
-  }
-
-  template<typename T, typename TagT>
   void SSDIndex<T, TagT>::init_buffers(uint64_t n_threads) {
     uint64_t n_buffers = n_threads * 2;
     LOG(INFO) << "Init buffers for " << n_threads << " threads, setup " << n_buffers << " buffers.";
@@ -76,31 +52,10 @@ namespace pipeann {
       this->thread_data_queue.push(data);
       this->reader->register_buf(data->sector_scratch, MAX_N_SECTOR_READS * SECTOR_LEN, 0);
     }
-
-#ifndef READ_ONLY_TESTS
-    // background thread.
-    LOG(INFO) << "Setup " << kBgIOThreads << " background I/O threads for insert...";
-    for (int i = 0; i < kBgIOThreads; ++i) {
-      bg_io_thread_[i] = new std::thread(&SSDIndex<T, TagT>::bg_io_thread, this);
-      bg_io_thread_[i]->detach();
-    }
-#endif
   }
 
   template<typename T, typename TagT>
   void SSDIndex<T, TagT>::destroy_buffers() {
-#ifndef READ_ONLY_TESTS
-    for (int i = 0; i < kBgIOThreads; ++i) {
-      if (bg_io_thread_[i] != nullptr) {
-        auto bg_task = new BgTask{
-            .thread_data = nullptr, .writes = {}, .pages_to_unlock = {}, .pages_to_deref = {}, .terminate = true};
-        bg_tasks.push(bg_task);
-        bg_tasks.push_notify_all();
-        bg_io_thread_[i] = nullptr;
-      }
-    }
-#endif
-
     while (!this->thread_data_bufs.empty()) {
       auto buf = this->thread_data_bufs.back();
       pipeann::aligned_free((void *) buf->coord_scratch);
@@ -126,7 +81,7 @@ namespace pipeann {
   }
 
   template<typename T, typename TagT>
-  int SSDIndex<T, TagT>::load(const char *index_prefix, uint32_t num_threads, bool use_page_search) {
+  int SSDIndex<T, TagT>::load(const char *index_prefix, uint32_t num_threads) {
     std::string disk_index_file = std::string(index_prefix) + "_disk.index";
     this->disk_index_file = disk_index_file;
 
@@ -150,7 +105,6 @@ namespace pipeann {
     this->max_nthreads = num_threads;
 
     // load page layout.
-    this->use_page_search_ = use_page_search;
     this->load_page_layout(index_prefix, meta_.nnodes_per_sector, meta_.npoints);
 
     // load tags
@@ -252,6 +206,56 @@ namespace pipeann {
   }
 
   template<typename T, typename TagT>
+  void SSDIndex<T, TagT>::load_nbr_store(uint32_t max_nbrs) {
+    std::string prefix = disk_index_file.substr(0, disk_index_file.rfind("_disk.index"));
+    std::string path = prefix + "_nbr_store_R" + std::to_string(max_nbrs) + ".bin";
+
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+      LOG(INFO) << "Loading neighbor store from " << path;
+      nbr_store_ = std::make_unique<NbrStore>();
+      if (nbr_store_->load(path)) {
+        return;
+      }
+      nbr_store_.reset();
+    }
+
+    LOG(INFO) << "Building neighbor store (R_max = " << max_nbrs << ") from " << disk_index_file;
+    nbr_store_ = std::make_unique<NbrStore>();
+    nbr_store_->init(meta_.npoints, max_nbrs);
+
+    void *ctx = reader->get_ctx();
+    char *sector_buf;
+    pipeann::alloc_aligned((void **) &sector_buf, size_per_io, SECTOR_LEN);
+
+    const uint64_t step = meta_.nnodes_per_sector > 0 ? 1 : DIV_ROUND_UP(meta_.max_node_len, SECTOR_LEN);
+    const uint64_t end = loc_sector_no(meta_.nnodes_per_sector > 0 ? meta_.npoints + meta_.nnodes_per_sector - 1
+                                                                   : meta_.npoints);
+    for (uint64_t sec = 1; sec < end; sec += step) {
+      std::vector<IORequest> reqs = {IORequest(sec * SECTOR_LEN, size_per_io, sector_buf, 0, 0, sector_buf)};
+      reader->read(reqs, ctx, false);
+
+      uint64_t first = sector_to_loc(sec, 0);
+      uint64_t n = meta_.nnodes_per_sector > 0 ? meta_.nnodes_per_sector : 1;
+      for (uint64_t off = 0; off < n; off++) {
+        uint64_t loc = first + off;
+        if (loc >= meta_.npoints) {
+          break;
+        }
+        uint32_t id = (loc < loc2id_.size()) ? loc2id_[loc] : loc;
+        if (id >= meta_.npoints) {
+          continue;
+        }
+        DiskNode<T> node = node_from_page(sector_buf, meta_.nnodes_per_sector > 0 ? off : 0);
+        nbr_store_->set(id, node.nnbrs, node.nbrs);
+      }
+    }
+    pipeann::aligned_free(sector_buf);
+    LOG(INFO) << "Neighbor store built: " << meta_.npoints << " nodes, " << nbr_store_->size_gb() << " GB";
+    nbr_store_->save(path);
+  }
+
+  template<typename T, typename TagT>
   Index<T, TagT> *SSDIndex<T, TagT>::load_to_mem(const std::string &filename) {
     std::string disk_index_file = std::string(filename) + "_disk.index";
     SSDIndexMetadata<T> meta;
@@ -320,25 +324,6 @@ namespace pipeann {
   }
 
   template<typename T, typename TagT>
-  int SSDIndex<T, TagT>::get_vector_by_id(const uint32_t &id, T *vector_coords) {
-    if (!enable_tags) {
-      LOG(INFO) << "Tags are disabled, cannot retrieve vector";
-      return -1;
-    }
-    uint32_t pos = id;
-    auto loc = id2loc(pos);
-
-    size_t num_sectors = loc_sector_no(loc);
-    std::ifstream disk_reader(disk_index_file.c_str(), std::ios::binary);
-    std::unique_ptr<char[]> sector_buf = std::make_unique<char[]>(size_per_io);
-    disk_reader.seekg(SECTOR_LEN * num_sectors, std::ios::beg);
-    disk_reader.read(sector_buf.get(), size_per_io);
-    DiskNode<T> node = node_from_page(sector_buf.get(), loc);
-    memcpy((void *) vector_coords, (void *) node.coords, meta_.data_dim * sizeof(T));
-    return 0;
-  }
-
-  template<typename T, typename TagT>
   TagT SSDIndex<T, TagT>::id2tag(uint32_t id) {
 #ifdef NO_MAPPING
     return id;  // use ID to replace tags.
@@ -370,108 +355,6 @@ namespace pipeann {
   }
 
   template<typename T, typename TagT>
-  void SSDIndex<T, TagT>::set_id2loc(uint32_t id, uint32_t loc) {
-#ifdef NO_MAPPING
-    return;
-#else
-    if (unlikely(id >= id2loc_.size())) {
-      id2loc_resize_mu_.lock();
-      if (likely(id >= id2loc_.size())) {
-        id2loc_.resize(1.5 * id);
-        LOG(INFO) << "Resize id2loc_ to " << id2loc_.size();
-      }
-      id2loc_resize_mu_.unlock();
-    }
-    // Here, we do not grab any locks. But no matter:
-    // Here, the id2loc_.size() must > id (as it only increases).
-    // So, we only need to ensure that no concurrent resize happens (use-after-free).
-    id2loc_resize_mu_.lock_shared();
-    id2loc_[id] = loc;
-    id2loc_resize_mu_.unlock_shared();
-#endif
-  }
-
-  template<typename T, typename TagT>
-  uint64_t SSDIndex<T, TagT>::id2page(uint32_t id) {
-    uint32_t loc = id2loc(id);
-    if (loc == kInvalidID) {
-      return kInvalidID;
-    }
-    return loc_sector_no(loc);
-  }
-
-  template<typename T, typename TagT>
-  uint32_t SSDIndex<T, TagT>::loc2id(uint32_t loc) {
-    loc2id_resize_mu_.lock_shared();
-    if (unlikely(loc > loc2id_.size())) {
-      LOG(ERROR) << "loc " << loc << " is out of range " << loc2id_.size();
-      crash();
-      return kInvalidID;
-    }
-    uint32_t ret = loc2id_[loc];
-    loc2id_resize_mu_.unlock_shared();
-    return ret;
-  }
-
-  template<typename T, typename TagT>
-  void SSDIndex<T, TagT>::set_loc2id(uint32_t loc, uint32_t id) {
-    if (unlikely(loc >= loc2id_.size())) {
-      loc2id_resize_mu_.lock();
-      if (likely(loc >= loc2id_.size())) {
-        loc2id_.resize(1.5 * loc);
-        LOG(INFO) << "Resize loc2id_ to " << loc2id_.size();
-      }
-      loc2id_resize_mu_.unlock();
-    }
-    loc2id_resize_mu_.lock_shared();
-    loc2id_[loc] = id;
-    loc2id_resize_mu_.unlock_shared();
-  }
-
-  template<typename T, typename TagT>
-  void SSDIndex<T, TagT>::erase_loc2id(uint32_t loc) {
-    loc2id_resize_mu_.lock_shared();
-    loc2id_[loc] = kInvalidID;
-    uint32_t st = sector_to_loc(loc_sector_no(loc), 0);
-    bool empty = true;
-    for (uint32_t i = st; i < st + meta_.nnodes_per_sector; ++i) {
-      if (loc2id_[i] != kInvalidID) {
-        empty = false;
-        break;
-      }
-    }
-    if (empty) {
-      empty_pages.push(loc_sector_no(loc));
-    }
-    uint32_t page = loc_sector_no(loc);
-    uint32_t offset = loc % meta_.nnodes_per_sector;
-    loc2id_resize_mu_.unlock_shared();
-  }
-
-  template<typename T, typename TagT>
-  void SSDIndex<T, TagT>::lock_vec(pipeann::SparseLockTable<uint64_t> &lock_table, uint32_t target,
-                                   const std::vector<uint32_t> &neighbors, bool rd) {
-    std::vector<uint32_t> to_lock;
-    to_lock.assign(neighbors.begin(), neighbors.end());
-    if (target != kInvalidID)
-      to_lock.push_back(target);
-    std::sort(to_lock.begin(), to_lock.end());
-    for (auto &id : to_lock) {
-      rd ? lock_table.rdlock(id) : lock_table.wrlock(id);
-    }
-  }
-
-  template<typename T, typename TagT>
-  void SSDIndex<T, TagT>::unlock_vec(pipeann::SparseLockTable<uint64_t> &lock_table, uint32_t target,
-                                     const std::vector<uint32_t> &neighbors) {
-    if (target != kInvalidID)
-      lock_table.unlock(target);
-    for (auto &id : neighbors) {
-      lock_table.unlock(id);
-    }
-  }
-
-  template<typename T, typename TagT>
   std::vector<uint32_t> SSDIndex<T, TagT>::get_to_lock_idx(uint32_t target, const std::vector<uint32_t> &neighbors) {
     std::vector<uint32_t> to_lock;
     to_lock.assign(neighbors.begin(), neighbors.end());
@@ -485,7 +368,6 @@ namespace pipeann {
     return to_lock;
   }
 
-  // Lock the mapping for target/page if use_page_search == false/true.
   template<typename T, typename TagT>
   std::vector<uint32_t> SSDIndex<T, TagT>::lock_idx(pipeann::SparseLockTable<uint64_t> &lock_table, uint32_t target,
                                                     const std::vector<uint32_t> &neighbors, bool rd) {
@@ -515,195 +397,6 @@ namespace pipeann {
 #ifndef READ_ONLY_TESTS
     lock_table.unlock(to_lock);
 #endif
-  }
-
-  // Two-level lock, as id2page may change before and after grabbing the lock.
-  template<typename T, typename TagT>
-  std::vector<uint32_t> SSDIndex<T, TagT>::lock_page_idx(pipeann::SparseLockTable<uint64_t> &lock_table,
-                                                         uint32_t target, const std::vector<uint32_t> &neighbors,
-                                                         bool rd) {
-#ifndef READ_ONLY_TESTS
-    if (!use_page_search_) {
-      return std::vector<uint32_t>();
-    }
-    std::vector<uint32_t> to_lock(neighbors.begin(), neighbors.end());
-    if (target != kInvalidID) {
-      to_lock.push_back(target);
-    }
-
-    for (size_t i = 0; i < to_lock.size(); ++i) {
-      to_lock[i] = id2page(to_lock[i]);
-    }
-
-    // Sort and deduplicate.
-    std::sort(to_lock.begin(), to_lock.end());
-    auto last = std::unique(to_lock.begin(), to_lock.end());
-    to_lock.erase(last, to_lock.end());
-
-    for (auto &id : to_lock) {
-      rd ? lock_table.rdlock(id) : lock_table.wrlock(id);
-    }
-    return to_lock;
-#else
-    return std::vector<uint32_t>();
-#endif
-  }
-
-  template<typename T, typename TagT>
-  void SSDIndex<T, TagT>::unlock_page_idx(pipeann::SparseLockTable<uint64_t> &lock_table,
-                                          const std::vector<uint32_t> &to_lock) {
-#ifndef READ_ONLY_TESTS
-    if (!use_page_search_) {
-      return;
-    }
-    for (auto &id : to_lock) {
-      lock_table.unlock(id);
-    }
-#endif
-  }
-
-  template<typename T, typename TagT>
-  typename SSDIndex<T, TagT>::PageArr SSDIndex<T, TagT>::get_page_layout(uint32_t page_no) {
-    loc2id_resize_mu_.lock_shared();
-    PageArr ret;
-    auto st = sector_to_loc(page_no, 0);
-    auto ed = meta_.nnodes_per_sector == 0 ? st + 1 : st + meta_.nnodes_per_sector;
-    for (uint32_t i = st; i < ed; ++i) {
-      ret.push_back(loc2id_[i]);
-    }
-    loc2id_resize_mu_.unlock_shared();
-    return ret;
-  }
-
-  template<typename T, typename TagT>
-  void SSDIndex<T, TagT>::erase_and_set_loc(const std::vector<uint64_t> &old_locs,
-                                            const std::vector<uint64_t> &new_locs,
-                                            const std::vector<uint32_t> &new_ids) {
-    std::lock_guard<std::mutex> lock(alloc_lock);
-    for (uint32_t i = 0; i < new_locs.size(); ++i) {
-      set_loc2id(new_locs[i], new_ids[i]);
-    }
-    for (auto &l : old_locs) {
-      erase_loc2id(l);
-    }
-  }
-
-  // Returns <loc, need_read>.
-  template<typename T, typename TagT>
-  std::vector<uint64_t> SSDIndex<T, TagT>::alloc_loc(int n, const std::vector<uint64_t> &hint_pages,
-                                                     std::set<uint64_t> &page_need_to_read) {
-    std::lock_guard<std::mutex> lock(alloc_lock);
-    std::vector<uint64_t> ret;
-    int cur = 0;
-    // Reuse.
-    uint32_t threshold = (meta_.nnodes_per_sector + INDEX_SIZE_FACTOR - 1) / INDEX_SIZE_FACTOR;
-
-    // 1. Use empty pages.
-    uint32_t empty_page = kInvalidID;
-    while ((empty_page = empty_pages.pop()) != kInvalidID) {
-#ifdef NO_POLLUTE_ORIGINAL
-      if (empty_page < loc_sector_no(meta_.npoints)) {
-        continue;
-      }
-#endif
-      auto st = sector_to_loc(empty_page, 0);
-      auto ed = meta_.nnodes_per_sector == 0 ? st + 1 : st + meta_.nnodes_per_sector;
-      for (uint32_t i = st; i < ed; ++i) {
-        if (unlikely(loc2id_[i] != kInvalidID)) {
-          LOG(ERROR) << "Page " << empty_page << " is not empty " << i << " " << loc2id_[i];
-          crash();
-        }
-        loc2id_[i] = kAllocatedID;
-        ret.push_back(i);
-        ++cur;
-        if (cur == n) {
-          return ret;
-        }
-      }
-    }
-
-    // 2. Use hint pages.
-    for (auto &p : hint_pages) {
-#ifdef NO_POLLUTE_ORIGINAL
-      if (p < loc_sector_no(meta_.npoints)) {
-        continue;
-      }
-#endif
-      // First, see the number of holes.
-      uint32_t cnt = 0;
-      auto st = sector_to_loc(p, 0);
-      auto ed = meta_.nnodes_per_sector == 0 ? st + 1 : st + meta_.nnodes_per_sector;
-      for (uint32_t i = st; i < ed; ++i) {
-        if (loc2id_[i] == kInvalidID) {
-          cnt++;
-        }
-      }
-      if (cnt < threshold) {
-        continue;
-      }
-      // Second, allocate them.
-      if (cnt < meta_.nnodes_per_sector) {
-        page_need_to_read.insert(p);
-      }
-      for (uint32_t i = st; i < ed; ++i) {
-        if (loc2id_[i] == kInvalidID) {
-          loc2id_[i] = kAllocatedID;
-          ret.push_back(i);
-          ++cur;
-          if (cur == n) {
-            return ret;
-          }
-        }
-      }
-    }
-
-    // 3. Use new pages.
-    int remaining = n - cur;
-    for (int i = 0; i < remaining; i++) {
-      set_loc2id(cur_loc + i, kAllocatedID);  // auto resize.
-      ret.push_back(cur_loc + i);
-    }
-
-    // Ensure that cur_loc is aligned.
-    // The hole will eventually be recycled using either empty page queue or hint pages.
-    cur_loc += remaining;
-    while (meta_.nnodes_per_sector != 0 && cur_loc % meta_.nnodes_per_sector != 0) {
-      set_loc2id(cur_loc++, kInvalidID);  // auto resize.
-    }
-    return ret;
-  }
-
-  template<typename T, typename TagT>
-  void SSDIndex<T, TagT>::verify_id2loc() {
-    // Verify id -> loc -> id map.
-    LOG(INFO) << "ID2loc size: " << id2loc_.size() << ", cur_loc: " << cur_loc.load() << ", cur_id: " << cur_id
-              << ", nnodes_per_sector: " << meta_.nnodes_per_sector;
-    for (uint32_t i = 0; i < cur_id; ++i) {
-      auto loc = id2loc(i);
-      if (unlikely(loc >= cur_loc.load())) {
-        LOG(ERROR) << "ID2loc inconsistency at ID: " << i << ", loc: " << loc << ", cur_loc: " << cur_loc.load();
-        crash();
-      }
-      if (unlikely(loc2id(loc) != i)) {
-        LOG(ERROR) << "ID2loc inconsistency at ID: " << i << ", loc: " << id2loc(i)
-                   << ", loc2id: " << loc2id(id2loc(i));
-        crash();
-      }
-    }
-
-    LOG(INFO) << "ID2loc consistency check passed.";
-
-    // Verify loc2id do not contain duplicate ids.
-    for (uint32_t i = 0; i < cur_loc; ++i) {
-      auto id = loc2id(i);
-      if (id != kInvalidID && id != kAllocatedID) {
-        uint32_t loc = id2loc(id);
-        if (unlikely(loc != i)) {
-          LOG(ERROR) << "loc2id inconsistency at loc: " << i << ", id: " << id << ", loc: " << loc;
-        }
-      }
-    }
-    LOG(INFO) << "loc2ID consistency check passed.";
   }
 
   template class SSDIndex<float>;

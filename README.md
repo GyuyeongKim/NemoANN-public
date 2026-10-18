@@ -1,376 +1,177 @@
-# GateANN: I/O-Efficient Filtered Vector Search on SSDs
+# NemoANN
 
-This repository contains the artifact for the paper:
+NemoANN is an SSD-based graph index for filtered approximate nearest neighbor search.
+It checks the query's filter in memory before it reads a candidate from the SSD.
+A candidate that passes is read and scored as usual.
+A candidate that fails is never read, but the search still moves through it by using an in-memory copy of its neighbor list and the PQ distances that are already in memory.
+We call this graph tunneling.
+The graph index and its on-disk layout are not modified, and the predicate is given at query time.
 
-> **GateANN: I/O-Efficient Filtered Vector Search on SSDs**
+This repository contains the implementation and the experiment scripts for the paper
 
-GateANN is an SSD-based graph ANNS system that achieves I/O-efficient filtered vector search on an **unmodified** graph index.
-It checks each node's filter metadata **before** issuing SSD I/O and uses **graph tunneling** to traverse non-matching nodes entirely in memory, eliminating up to 90% of SSD reads at 10% selectivity while maintaining recall comparable to post-filtering baselines.
+> Nakyung Lee, Soobin Cho, Jiwoong Park, and Gyuyeong Kim.
+> **NemoANN: I/O-Efficient Filtered Vector Search on SSDs with Graph Tunneling.**
+> ACM Symposium on Cloud Computing (SoCC '26), 2026.
 
-GateANN is implemented as a single additional search mode on top of the [PipeANN](https://github.com/thustorage/PipeANN) codebase.
+NemoANN is built on [PipeANN](https://github.com/thustorage/PipeANN) (commit `6a0403c`).
+An earlier version of this work appeared on arXiv under the name GateANN.
 
-## Key Results
+## Key results
 
-- Up to **10x fewer SSD I/Os** vs. post-filter baselines
-- Up to **7.6x higher throughput** at 10% selectivity with comparable recall
-- Works on **any filter predicate** without index rebuild
-- Scales from 10M to **1B vectors** on a single commodity server
+On BigANN-100M at 10% selectivity and 90% Recall@10 with 32 threads:
 
----
+- NemoANN issues about 10x fewer SSD reads than post-filtering.
+- Its throughput is 8.0x that of PipeANN with post-filtering and 5.0x that of PipeANN-Filter.
+- At 5% selectivity, the gain over PipeANN grows to 13.1x.
+- It keeps the original index, which is 14x smaller on SSD than the densified index of PipeANN-Filter.
 
-## Table of Contents
+On BigANN-1B, NemoANN reaches 9.7K QPS against 1.7K QPS for PipeANN (5.7x).
 
-- [Hardware Requirements](#hardware-requirements)
-- [Software Dependencies](#software-dependencies)
-- [Getting Started (~30 min)](#getting-started)
-- [Directory Structure](#directory-structure)
-- [Datasets](#datasets)
-- [Building the Index](#building-the-index)
-- [Reproducing Results](#reproducing-results)
-  - [Quick Validation (~10 min)](#quick-validation)
-  - [Full Reproduction (~24 hours)](#full-reproduction)
-  - [Per-Figure Scripts](#per-figure-scripts)
-- [Citation](#citation)
+## Repository layout
 
----
+| Path | Contents |
+|------|----------|
+| `include/`, `src/` | PipeANN core and NemoANN |
+| `tests/` | Index build and search binaries |
+| `scripts/` | Build, data preparation, and experiment scripts |
+| `patches/` | Fix applied to the official DiskANN for the Filtered-DiskANN baseline |
+| `third_party/liburing` | liburing 2.10 (git submodule) |
 
-## Hardware Requirements
+The NemoANN code is in the following files.
 
-| Component | Minimum | Recommended (Paper Setup) |
-|-----------|---------|---------------------------|
-| CPU | x86-64 with AVX2 | 2× Intel Xeon Silver 4514Y (32 Cores) |
-| DRAM | 64 GB | 256 GB |
-| SSD | 1 TB NVMe | 2 TB NVMe |
-| OS | Linux 5.10+ (io_uring) | Ubuntu 22.04 LTS |
+| File | Role |
+|------|------|
+| `include/utils/filter_store.h` | Single-label filter store |
+| `include/utils/spmat_filter_store.h` | Multi-label filter store (a node passes if it has every query label) |
+| `include/utils/nbr_store.h` | Neighbor store |
+| `src/search/pipe_search.cpp` | Filter check before SSD submission and graph tunneling |
+| `src/ssd_index.cpp` | Neighbor store construction (`load_nbr_store`) |
 
-**Notes:**
-- `io_uring` support requires Linux kernel >= 5.1 (5.10+ recommended).
-- DRAM requirements depend on dataset scale and `R_max` setting:
-  - 100M vectors, R_max=32: ~17 GB (index + neighbor store)
-  - 1B vectors, R_max=16: ~70 GB
-- All experiments in the paper use a single machine (no distributed setup).
+## Requirements
 
-## Software Dependencies
+The paper's testbed is a server with two Intel Xeon Silver 4514Y CPUs (32 cores), 256 GB of DDR5 memory, and a Samsung PM9A3 2 TB NVMe SSD, running Ubuntu 22.04 with Linux 5.15.
+
+NemoANN needs Linux with `io_uring`, GCC 9 or later, CMake 3.13 or later, a BLAS library (MKL or OpenBLAS), tcmalloc, and Python 3 with `numpy` and `faiss-cpu`.
+On Ubuntu 22.04, `scripts/install_deps.sh` installs everything, including the packages needed to build the two baselines.
+
+| Dataset | Disk index | Neighbor store (R_max = 32) |
+|---------|-----------:|----------------------------:|
+| BigANN-100M | 58.5 GB | 12.3 GB |
+| DEEP-100M | 82 GB | 12.3 GB |
+| BigANN-1B | 683 GB | 123 GB |
+
+The neighbor store comes on top of the 32-byte PQ codes that PipeANN already keeps in memory (3.2 GB per 100M vectors).
+
+## Build
 
 ```bash
-# One-step installation (Ubuntu 22.04)
+git clone --recursive <repository URL> nemoann
+cd nemoann
 ./scripts/install_deps.sh
-
-# Or manually:
-sudo apt-get update
-sudo apt-get install -y build-essential cmake g++ libmkl-dev \
-    libomp-dev libgoogle-perftools-dev python3 python3-pip
-pip3 install matplotlib numpy
-cd third_party/liburing && ./configure && make -j && cd ../..
+./scripts/build.sh
 ```
 
-**Summary:**
-| Dependency | Version | Purpose |
-|------------|---------|---------|
-| CMake | >= 3.5 | Build system |
-| GCC | >= 9.0 | C++17 support |
-| Intel MKL / OpenBLAS | any | BLAS for distance computation |
-| liburing | >= 2.0 | Async I/O (included) |
-| tcmalloc | any | Memory allocator (`libgoogle-perftools-dev`) |
-| OpenMP | >= 4.5 | Thread parallelism |
-| Python 3 | >= 3.8 | Plotting scripts |
-| matplotlib | >= 3.5 | Figure generation |
-
----
-
-## Getting Started
-
-### 1. Build
-
-```bash
-git clone https://github.com/GyuyeongKim/GateANN.git
-cd GateANN
-
-# Build liburing (if not installed system-wide)
-cd third_party/liburing && ./configure && make -j && cd ../..
-
-# Build GateANN
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-```
-
-### 2. Verify Build
-
-After a successful build, the following binaries should exist in `build/tests/`:
-
-| Binary | Description |
-|--------|-------------|
-| `build_disk_index` | Build Vamana graph index on SSD |
-| `build_memory_index` | Build in-memory Vamana index |
-| `search_disk_index_fa` | **Main experiment binary** (modes 0/2/8/9) |
-| `search_disk_index_yfcc` | YFCC multi-label experiment binary |
-| `search_mem_fa` | In-memory Vamana baseline |
-
-### 3. Quick Smoke Test
-
-```bash
-# Run a quick validation with BigANN-100M (requires data + index)
-./scripts/quick_validate.sh
-```
-
----
-
-## Directory Structure
-
-```
-GateANN/
-├── README.md                     # This file
-├── CMakeLists.txt                # Top-level build configuration
-├── include/                      # Header files
-│   ├── ssd_index.h               # SSD index with search mode dispatch
-│   ├── utils/
-│   │   ├── filter_store.h        # [GateANN] Single-label filter store
-│   │   ├── spmat_filter_store.h  # [GateANN] Multi-label filter store (CSR)
-│   │   └── full_adj_index.h      # [GateANN] Neighbor store for tunneling
-│   ├── nbr/                      # PQ distance computation
-│   └── filter/                   # Filter selector interface
-├── src/                          # Source files
-│   ├── search/
-│   │   ├── pipe_search.cpp       # Asynchronous pipeline search (core)
-│   │   └── beam_search.cpp       # Synchronous beam search (DiskANN)
-│   ├── ssd_index.cpp             # SSD index management
-│   └── ...
-├── tests/                        # Experiment binaries
-│   ├── search_disk_index_fa.cpp  # Main filtered search experiments
-│   ├── search_disk_index_yfcc.cpp # YFCC multi-label experiments
-│   └── search_mem_fa.cpp         # In-memory Vamana baseline
-├── scripts/                      # Experiment and plotting scripts
-│   ├── run_all.sh                # Master script: reproduce all figures
-│   ├── fig01_pareto.sh           # Per-figure experiment scripts
-│   ├── plot_pareto_bigann.py     # Per-figure plotting scripts
-│   └── ...
-├── third_party/
-│   └── liburing/                 # io_uring library (included)
-├── data/                         # Datasets (download separately)
-└── figures/                      # Generated figures (output)
-```
-
-### GateANN-Specific Files
-
-The following files contain GateANN's contributions on top of PipeANN:
-
-| File | Lines | Description |
-|------|-------|-------------|
-| `include/utils/filter_store.h` | ~60 | O(1) single-label pre-IO filter check |
-| `include/utils/spmat_filter_store.h` | ~80 | CSR-based multi-label subset predicate |
-| `include/utils/full_adj_index.h` | ~140 | Neighbor store for graph tunneling |
-| `src/search/pipe_search.cpp` (lines 352-401) | ~50 | Pre-IO filter check + tunneling logic |
-
----
+`build.sh` builds liburing and then the binaries in `build/tests`.
 
 ## Datasets
 
-The paper evaluates on four datasets:
-
-| Dataset | Vectors | Dimensions | Type | Size | Labels |
-|---------|---------|------------|------|------|--------|
-| BigANN-100M | 100M | 128 | uint8 | 12.8 GB | Synthetic (uniform/Zipf) |
-| DEEP-100M | 100M | 96 | float32 | 38.4 GB | Synthetic (uniform) |
-| YFCC-10M | 10M | 192 | uint8 | 1.9 GB | Real multi-label |
-| BigANN-1B | 1B | 128 | uint8 | 128 GB | Synthetic (uniform) |
-
-### Download
-
 ```bash
-# BigANN-100M (required for most experiments)
-./scripts/setup_data.sh bigann100M
-
-# DEEP-100M
-./scripts/setup_data.sh deep100M
-
-# YFCC-10M (includes real multi-label metadata)
-./scripts/setup_data.sh yfcc10M
-
-# BigANN-1B (requires ~200 GB disk space for index + data)
-./scripts/setup_data.sh bigann1B
+./scripts/prepare.sh bigann100M
+./scripts/prepare.sh deep100M
+./scripts/prepare.sh bigann1B
 ```
 
----
+For each dataset, `prepare.sh` performs four steps.
 
-## Building the Index
+1. It downloads the first N vectors of the BigANN or DEEP base set and the public 10K query set.
+2. It builds the Vamana disk index with 32-byte PQ (R = 96 and L = 128 for the 100M datasets, R = 128 and L = 200 for BigANN-1B).
+3. It builds PipeANN's in-memory navigation graph from a 1% sample.
+4. It generates labels and the exact filtered ground truth with `scripts/make_labels.py`.
 
-Parameters: `build_disk_index <type> <base_file> <index_prefix> <R> <L> <PQ_dim> <merge_threshold> <build_threads>`
+Each base vector receives one of C labels uniformly at random, where C = 100 / selectivity (in percent), and each query receives one label in the same way.
+The random seeds are fixed, so the label files are identical to the ones used in the paper.
+The ground truth holds, for every query, the 10 nearest base vectors by exact L2 distance among the vectors that carry the query's label.
+BigANN-100M gets labels for 5%, 10%, and 20% selectivity, and the other datasets get 10%.
 
-### BigANN-100M
+Data goes to `data/` and results go to `results/`.
+Set `NEMO_DATA` and `NEMO_RESULTS` to use other locations, and `NEMO_BUILD_MEM` to change the memory budget of index construction (default 200 GB).
 
-```bash
-./build/tests/build_disk_index uint8 \
-    data/bigann100M/bigann100M_base.u8bin \
-    data/bigann100M/index/bigann100M \
-    128 200 32 80 60
-```
-
-### DEEP-100M
-
-```bash
-./build/tests/build_disk_index float \
-    data/deep100M/deep100M_base.fbin \
-    data/deep100M/index/deep100M \
-    128 200 32 80 60
-```
-
-### YFCC-10M
+## Running a search
 
 ```bash
-./build/tests/build_disk_index uint8 \
-    data/yfcc10M/yfcc10M_base.u8bin \
-    data/yfcc10M/index/yfcc10M \
-    128 200 32 80 60
+build/tests/search_disk_index <uint8|int8|float> <index_prefix> <threads> <W> <query.bin> \
+    <base_labels> <query_labels> <gt.bin> <K> <diskann|pipeann|nemoann> <mem_L> <R_max> <L1> [L2 ...]
 ```
 
-### BigANN-1B
+- `diskann` runs synchronous beam search, `pipeann` runs PipeANN's pipelined search, and both filter the results afterwards.
+  `nemoann` runs PipeANN's pipelined search with the filter check and graph tunneling.
+- Labels are either `.bin` files with one `uint8` label per vector or `.spmat` files with a set of labels per vector.
+- `R_max` is the number of neighbors per node in the neighbor store and is used only by `nemoann`.
+  The store is built from the disk index on first use and saved as `<index_prefix>_nbr_store_R<R_max>.bin`.
 
-**Note:** Building a 1B-scale index requires substantial resources. The merge phase alone can use ~200 GB of temporary disk space, and DRAM usage peaks at ~128 GB. We used a dedicated 2 TB NVMe SSD for index construction to avoid running out of space.
+For every L, the binary prints the throughput, the mean latency (threads divided by throughput), Recall@K, the mean number of SSD reads and tunneled nodes per query, a time breakdown, and the resident memory.
 
 ```bash
-./build/tests/build_disk_index uint8 \
-    data/bigann1B/bigann1B_base.u8bin \
-    data/bigann1B/index/bigann1B \
-    128 200 32 80 60
+build/tests/search_disk_index uint8 data/bigann100M/index/bigann100M 32 32 data/bigann100M/query.u8bin \
+    data/bigann100M/labels/sel10_base.bin data/bigann100M/labels/sel10_query.bin \
+    data/bigann100M/labels/sel10_gt.bin 10 nemoann 10 32 200
 ```
 
-### In-memory Vamana Baseline
+`build/tests/search_mem_index` runs in-memory Vamana search with post-filtering on the same index.
+
+## Reproducing the key results
+
+| Script | Paper | What it runs |
+|--------|-------|--------------|
+| `run_main.sh` | Fig. 5, Fig. 7(a), Sec. 5.2.1, 5.2.3 | DiskANN, PipeANN, and NemoANN on BigANN-100M and DEEP-100M at 10% selectivity |
+| `run_rmax.sh` | Fig. 6, Sec. 5.2.2 | NemoANN with R_max of 4, 8, 16, 32, 48, and 64 |
+| `run_billion.sh` | Fig. 8, Sec. 5.2.4 | DiskANN, PipeANN, and NemoANN on BigANN-1B |
+| `run_vamana.sh` | Fig. 9, Sec. 5.2.5 | In-memory Vamana with post-filtering |
+| `run_fdiskann.sh` | Fig. 10, Sec. 5.2.6 | Filtered-DiskANN |
+| `run_selectivity.sh` | Fig. 11, Fig. 7(b), Sec. 5.3.1 | PipeANN and NemoANN on BigANN-100M at 5%, 10%, and 20% selectivity |
+| `run_pipeann_filter.sh` | Figs. 5, 6, 7(a), 10, 11 | PipeANN-Filter |
+
+Every script sweeps the search list size L with 1 and 32 threads, appends one row per point to `results/<script>.tsv`, and keeps the raw output in `results/logs/`.
+Set `THREADS` to change the thread counts.
+The summary script reports throughput and SSD reads at a given recall, interpolated along each L sweep, together with NemoANN's speedup.
 
 ```bash
-./build/tests/build_memory_index uint8 \
-    data/bigann100M/bigann100M_base.u8bin \
-    data/bigann100M/index/bigann100M_mem \
-    128 200
+./scripts/summarize.py --recall 0.9
 ```
 
-### Neighbor Store (FullAdjIndex)
+The experiments use the settings of the paper.
+DiskANN uses W = 8, and PipeANN, NemoANN, and PipeANN-Filter use W = 32.
+PipeANN and NemoANN start from the in-memory navigation graph (`mem_L = 10`), and NemoANN uses R_max = 32.
+All runs use the 10K public queries and report Recall@10.
+The scripts run each point of DiskANN, PipeANN, NemoANN, and PipeANN-Filter in a new process, and sweep L in one process for Vamana and Filtered-DiskANN.
 
-GateANN (mode=8) requires a neighbor store that maps each node to its top-`R_max` graph neighbors in DRAM. The store is built automatically on first run and saved as `<index_prefix>_full_adj_<R_max>.bin`. Subsequent runs load it directly via `mmap`, so the one-time construction cost is amortized across experiments.
+### Baselines
 
-### Filtered-DiskANN Comparison (Figure 11)
+`run_pipeann_filter.sh` builds PipeANN-Filter from the upstream [PipeANN](https://github.com/thustorage/PipeANN) repository (commit `6c7d9da` by default).
+The index uses R = 96, R_dense = 1100, L = 128, and 32-byte PQ.
+PipeANN-Filter stores labels inside each 8 KB record, so every label set needs its own index, which takes about 820 GB for a 100M dataset.
+It runs without an in-memory navigation graph (`mem_L = 0`).
+Set `SELS` to choose the selectivities.
 
-Figure 11 compares against [Filtered-DiskANN](https://github.com/microsoft/DiskANN), which builds a **label-aware** FilteredVamana graph index. This requires the official DiskANN repository:
-
-```bash
-# Clone and build official DiskANN
-git clone https://github.com/microsoft/DiskANN.git
-cd DiskANN && mkdir build && cd build && cmake .. && make -j$(nproc)
-export DISKANN_BUILD_DIR=$(pwd)
-cd ../../..
-```
-
-Build FilteredVamana indices:
-
-```bash
-# BigANN-100M (R=96, FilteredLbuild=100)
-$DISKANN_BUILD_DIR/apps/build_disk_index --data_type uint8 --dist_fn l2 \
-    --data_path data/bigann100M/bigann100M_base.u8bin \
-    --index_path_prefix data/pipeann_indices/bigann100M_official_filtered \
-    -R 96 --FilteredLbuild 100 -B 4 -M 80 -T 64 --PQ_disk_bytes 0 \
-    --label_file data/filter_exp_100M/bigann100M_node_labels.txt
-
-# DEEP-100M (R=96, FilteredLbuild=128)
-$DISKANN_BUILD_DIR/apps/build_disk_index --data_type float --dist_fn l2 \
-    --data_path data/deep100M/deep100M_base.fbin \
-    --index_path_prefix data/pipeann_indices/deep100M_official_filtered \
-    -R 96 --FilteredLbuild 128 -B 4 -M 80 -T 64 --PQ_disk_bytes 0 \
-    --label_file data/filter_exp_100M/deep100M_node_labels.txt
-```
-
-The `--label_file` expects a text file with one label per line (generated by `setup_data.sh`). The `fig11_fdiskann.sh` script automates both the build (if needed) and search.
-
----
-
-## Reproducing Results
-
-### Search Modes
-
-| Mode | System | Description |
-|------|--------|-------------|
-| 0 | DiskANN | Synchronous beam search (post-filter) |
-| 2 | PipeANN | Asynchronous pipeline search (post-filter) |
-| **8** | **GateANN** | **Pre-IO filter check + graph tunneling** |
-| 9 | PipeANN+EarlyFilter | Skip exact distance for non-matching (ablation) |
-
-### Quick Validation
-
-Run a subset of the main experiments to verify the artifact (~10 min):
-
-```bash
-./scripts/quick_validate.sh
-```
-
-This runs BigANN-100M at 10% selectivity with T=1 and a few L values, comparing DiskANN (mode=0), PipeANN (mode=2), and GateANN (mode=8). Expected output:
-- GateANN should achieve **5-8x higher QPS** than PipeANN at comparable recall
-- GateANN should use **~10x fewer SSD I/Os** than PipeANN
-
-### Full Reproduction
-
-To reproduce all paper figures (~24 hours total):
-
-```bash
-./scripts/run_all.sh
-```
-
-This sequentially runs all experiments and generates all figures in `figures/`.
-
-### Per-Figure Scripts
-
-Each figure in the paper has a dedicated experiment + plot script pair:
-
-| Figure | Paper Section | Script | Plot | Est. Time |
-|--------|---------------|--------|------|-----------|
-| Fig. 1(a-b) | Motivation | `scripts/fig01_motivation.sh` | `scripts/plot_motivation.py` | 30 min |
-| Fig. 5(a-d) | Pareto (100M) | `scripts/fig05_pareto_main.sh` | `scripts/plot_pareto_bigann.py`, `plot_pareto_deep.py` | 3 hr |
-| Fig. 6 | Thread scaling | `scripts/fig06_thread_scaling.sh` | `scripts/plot_thread_scaling.py` | 30 min |
-| Fig. 7(a-b) | I/O reduction | `scripts/fig07_io_reduction.sh` | `scripts/plot_io_reduction.py` | 1 hr |
-| Fig. 8(a-b) | BigANN-1B | `scripts/fig08_billion.sh` | `scripts/plot_pareto_bigann1B.py` | 6 hr |
-| Fig. 9 | YFCC-10M | `scripts/fig09_yfcc.sh` | `scripts/plot_yfcc_tput.py` | 30 min |
-| Fig. 10(a-b) | Vamana comparison | `scripts/fig10_vamana.sh` | `scripts/plot_vamana.py` | 1 hr |
-| Fig. 11(a-b) | F-DiskANN comparison | `scripts/fig11_fdiskann.sh` | `scripts/plot_fdiskann.py` | 2 hr |
-| Fig. 12 | Selectivity sweep | `scripts/fig12_selectivity.sh` | `scripts/plot_selectivity.py` | 1 hr |
-| Fig. 13(a-b) | R_max sweep | `scripts/fig13_nbrs_sweep.sh` | `scripts/plot_nbrs_qps.py`, `plot_nbrs_pareto.py` | 2 hr |
-| Fig. 14(a-b) | Zipf distribution | `scripts/fig14_zipf.sh` | `scripts/plot_zipf.py` | 1 hr |
-| Fig. 15 | Spatial correlation | `scripts/fig15_spatial.sh` | `scripts/plot_spatial_correlation.py` | 1 hr |
-| Fig. 16(a-b) | Range predicates | `scripts/fig16_range.sh` | `scripts/plot_range_predicate.py` | 1 hr |
-| Fig. 17(a-b) | Pipeline depth | `scripts/fig17_bw_sweep.sh` | `scripts/plot_bw_sweep.py` | 1 hr |
-| Fig. 18(a-b) | Ablation | `scripts/fig18_ablation.sh` | `scripts/plot_early_filter.py` | 1 hr |
-| Table 4 | SSD speed impact | `scripts/tab04_ssd_impact.sh` | (printed to stdout) | 30 min |
-| Table 5 | Time breakdown | `scripts/tab05_breakdown.sh` | (printed to stdout) | 15 min |
-
-**Usage:**
-```bash
-# Run a single figure's experiment + plot
-./scripts/fig05_pareto_main.sh      # runs experiment, writes results to data/
-python3 scripts/plot_pareto_bigann.py   # generates figures/fig_pareto_bigann_{lat,tput}.{eps,png}
-
-# Or use the convenience wrapper
-./scripts/run_figure.sh 5           # runs experiment + plot for Figure 5
-```
-
----
+`run_fdiskann.sh` builds the official [DiskANN](https://github.com/microsoft/DiskANN) at commit `f198a8a` with `patches/diskann-label-parse.patch`.
+The patch replaces a scan in label-file parsing that stalls index loading for single-label files, and it does not change the search.
+The FilteredVamana index uses R = 96 and a filtered build list of 100 for BigANN-100M and 128 for DEEP-100M.
 
 ## Citation
 
 ```bibtex
-@misc{gateann,
-  title = {{GateANN}: {I/O}-Efficient Filtered Vector Search on {SSDs}},
-  author = {Nakyung Lee and Soobin Cho and Jiwoong Park and Gyuyeong Kim},
-  year = {2026},
-  eprint = {2603.21466},
-  archiveprefix = {arXiv},
-  primaryclass = {cs.OS},
-  url = {https://arxiv.org/abs/2603.21466}
+@inproceedings{nemoann,
+  author    = {Lee, Nakyung and Cho, Soobin and Park, Jiwoong and Kim, Gyuyeong},
+  title     = {{NemoANN}: {I/O}-Efficient Filtered Vector Search on {SSDs} with Graph Tunneling},
+  booktitle = {Proceedings of the ACM Symposium on Cloud Computing (SoCC '26)},
+  year      = {2026},
+  address   = {Singapore},
+  publisher = {ACM},
+  doi       = {10.1145/3828161.3857852}
 }
 ```
 
----
-
-## Acknowledgments
-
-GateANN is built on top of [PipeANN](https://github.com/thustorage/PipeANN). We thank the PipeANN authors for making their codebase available.
-
 ## License
 
-This project is released under the MIT License. See [LICENSE](LICENSE) for details.
+NemoANN is released under the MIT License.
+See `NOTICE.txt` for the PipeANN license and third-party notices.

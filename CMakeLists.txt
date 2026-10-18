@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5)
-project(gateann)
+project(nemoann)
 
 set(CMAKE_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)

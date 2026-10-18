@@ -77,9 +77,6 @@ class AlignedFileReader {
   virtual int poll(void *ctx) = 0;
   virtual void poll_all(void *ctx) = 0;
   virtual void poll_wait(void *ctx) = 0;
-  // Returns number of unconsumed CQ entries (non-destructive, no syscall).
-  // Used by eager cache to detect IO completions during processing.
-  virtual unsigned cq_ready(void *ctx) { return 0; }
 
  protected:
   // register thread-id for a context

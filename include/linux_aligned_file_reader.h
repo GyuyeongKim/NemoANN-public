@@ -40,7 +40,6 @@ class LinuxAlignedFileReader : public AlignedFileReader {
   int poll(void *ctx);
   void poll_all(void *ctx);
   void poll_wait(void *ctx);
-  unsigned cq_ready(void *ctx) override;
 
   // register thread-id for a context
   void register_thread(int flag = 0);

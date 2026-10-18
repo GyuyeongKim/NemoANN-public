@@ -1,0 +1,45 @@
+diff --git a/src/pq_flash_index.cpp b/src/pq_flash_index.cpp
+index 9580537e..eaec5c22 100644
+--- a/src/pq_flash_index.cpp
++++ b/src/pq_flash_index.cpp
+@@ -624,14 +624,10 @@ void PQFlashIndex<T, LabelT>::get_label_file_metadata(const std::string &fileCon
+         }
+ 
+         size_t lbl_pos = cur_pos;
+-        size_t next_lbl_pos = 0;
+-        while (lbl_pos < next_pos && lbl_pos != std::string::npos)
++        while (lbl_pos < next_pos)
+         {
+-            next_lbl_pos = fileContent.find(',', lbl_pos);
+-            if (next_lbl_pos == std::string::npos) // the last label
+-            {
+-                next_lbl_pos = next_pos;
+-            }
++            const char *found = (const char *)memchr(fileContent.c_str() + lbl_pos, ',', next_pos - lbl_pos);
++            size_t next_lbl_pos = found ? (size_t)(found - fileContent.c_str()) : next_pos;
+ 
+             num_total_labels++;
+ 
+@@ -703,19 +699,10 @@ void PQFlashIndex<T, LabelT>::parse_label_file(std::basic_istream<char> &infile,
+         num_lbls_in_cur_pt = 0;
+ 
+         size_t lbl_pos = cur_pos;
+-        size_t next_lbl_pos = 0;
+-        while (lbl_pos < next_pos && lbl_pos != std::string::npos)
++        while (lbl_pos < next_pos)
+         {
+-            next_lbl_pos = buffer.find(',', lbl_pos);
+-            if (next_lbl_pos == std::string::npos) // the last label in the whole file
+-            {
+-                next_lbl_pos = next_pos;
+-            }
+-
+-            if (next_lbl_pos > next_pos) // the last label in one line, just read to the end
+-            {
+-                next_lbl_pos = next_pos;
+-            }
++            const char *found = (const char *)memchr(buffer.c_str() + lbl_pos, ',', next_pos - lbl_pos);
++            size_t next_lbl_pos = found ? (size_t)(found - buffer.c_str()) : next_pos;
+ 
+             label_str.assign(buffer.c_str() + lbl_pos, next_lbl_pos - lbl_pos);
+             if (label_str[label_str.length() - 1] == '\t') // '\t' won't exist in label file?

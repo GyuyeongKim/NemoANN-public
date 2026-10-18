@@ -1,33 +1,9 @@
-# Build
 build/
-cmake-build-*/
-
-# Data (large files, download separately)
-data/*.bin
-data/*.u8bin
-data/*.fbin
-data/**/*.bin
-data/**/*.u8bin
-data/**/*.fbin
-data/**/index/
-
-# Results and figures are tracked
-# data/filter/results/
-# figures/
-
-# IDE
+baselines/
+data/
+results/
+__pycache__/
 .vscode/
 .idea/
 *.swp
-*.swo
-*~
-
-# OS
 .DS_Store
-Thumbs.db
-
-# Compiled
-*.o
-*.a
-*.so
-data/pipeann_indices/

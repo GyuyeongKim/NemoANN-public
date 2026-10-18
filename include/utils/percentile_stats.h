@@ -23,12 +23,10 @@ namespace pipeann {
     double n_cache_hits = 0;    // # cache_hits
     double n_hops = 0;          // # search hops
     double n_current_used = 0;  // # force return for latency limit
-    double n_filter_skip = 0;   // # nodes skipped by pre-IO filter check (mode=8)
-
-    // Time breakdown (microseconds, mode=8 filter-aware search)
-    double bd_io_us = 0;        // IO submit + poll + wait
-    double bd_tunnel_us = 0;    // filter check + FullAdjIndex lookup + PQ distance
-    double bd_process_us = 0;   // exact distance + neighbor expansion on IO-completed nodes
+    double n_tunnels = 0;
+    double bd_io_us = 0;
+    double bd_tunnel_us = 0;
+    double bd_process_us = 0;
   };
 
   inline double get_percentile_stats(QueryStats *stats, uint64_t len, float percentile,
