@@ -13,9 +13,6 @@ This repository contains the implementation and the experiment scripts for the p
 > **NemoANN: I/O-Efficient Filtered Vector Search on SSDs with Graph Tunneling.**
 > ACM Symposium on Cloud Computing (SoCC '26), 2026.
 
-NemoANN is built on [PipeANN](https://github.com/thustorage/PipeANN) (commit `6a0403c`).
-An earlier version of this work appeared on arXiv under the name GateANN.
-
 ## Key results
 
 On BigANN-100M at 10% selectivity and 90% Recall@10 with 32 threads:
@@ -49,8 +46,6 @@ The NemoANN code is in the following files.
 
 ## Requirements
 
-The paper's testbed is a server with two Intel Xeon Silver 4514Y CPUs (32 cores), 256 GB of DDR5 memory, and a Samsung PM9A3 2 TB NVMe SSD, running Ubuntu 22.04 with Linux 5.15.
-
 NemoANN needs Linux with `io_uring`, GCC 9 or later, CMake 3.13 or later, a BLAS library (MKL or OpenBLAS), tcmalloc, and Python 3 with `numpy` and `faiss-cpu`.
 On Ubuntu 22.04, `scripts/install_deps.sh` installs everything, including the packages needed to build the two baselines.
 
@@ -65,8 +60,8 @@ The neighbor store comes on top of the 32-byte PQ codes that PipeANN already kee
 ## Build
 
 ```bash
-git clone --recursive <repository URL> nemoann
-cd nemoann
+git clone --recursive https://github.com/GyuyeongKim/NemoANN-public.git
+cd NemoANN-public
 ./scripts/install_deps.sh
 ./scripts/build.sh
 ```
@@ -174,4 +169,5 @@ The FilteredVamana index uses R = 96 and a filtered build list of 100 for BigANN
 ## License
 
 NemoANN is released under the MIT License.
+The code is a modified version of [PipeANN](https://github.com/thustorage/PipeANN) (commit `6a0403c`).
 See `NOTICE.txt` for the PipeANN license and third-party notices.
