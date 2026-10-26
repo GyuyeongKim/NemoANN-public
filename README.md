@@ -7,6 +7,8 @@ A candidate that fails is never read, but the search still moves through it by u
 We call this graph tunneling.
 The graph index and its on-disk layout are not modified, and the predicate is given at query time.
 
+<p align="center"><img src="assets/how_it_works.svg" width="820" alt="Animation at the measured speed: on the same toy graph, a search thread of PipeANN with post-filtering reads every node it visits from the SSD and answers one query in 15.2 ms, while a thread of NemoANN reads only the nodes with the query's label, tunnels through the other nodes in memory, and answers eight queries in the same time"></p>
+
 This repository contains the implementation and the experiment scripts for the paper
 
 > Nakyung Lee, Soobin Cho, Jiwoong Park, and Gyuyeong Kim.
